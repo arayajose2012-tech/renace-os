@@ -25,16 +25,20 @@ rm -f /etc/xdg/autostart/org.gnome.Software.desktop \
 # Los ayudantes de Debian instalan GRUB con apt durante la instalación, lo que
 # falla en un Mac que aún no tiene red. La imagen ya trae los binarios de GRUB
 # (EFI de 64 y de 32 bits, y BIOS), así que se sustituyen por versiones locales.
-for dir in /usr/sbin /usr/bin /usr/libexec /usr/lib/calamares; do
-    for nombre in calamares-bootloader-config calamares-sources-media; do
-        if [ -e "$dir/$nombre" ]; then
-            dpkg-divert --quiet --add --rename \
-                --divert "$dir/$nombre.debian" "$dir/$nombre"
-            cp "/usr/share/renace/calamares/$nombre" "$dir/$nombre"
-            chmod 755 "$dir/$nombre"
-            echo "Renace: sustituido $dir/$nombre"
-        fi
-    done
+echo "Renace: archivos de calamares-settings-debian:"
+dpkg -L calamares-settings-debian | grep -iE 'bootloader|sources|helper' || true
+
+for nombre in calamares-bootloader-config calamares-sources-media; do
+    # Se localiza por el listado del paquete: la ruta cambia entre versiones
+    ruta=$(dpkg -L calamares-settings-debian | grep "/$nombre\$" | head -n1)
+    if [ -z "$ruta" ] || [ ! -f "$ruta" ]; then
+        echo "ERROR Renace: no se encontró $nombre; el instalador fallaría sin red." >&2
+        exit 1
+    fi
+    dpkg-divert --quiet --add --rename --divert "$ruta.debian" "$ruta"
+    cp "/usr/share/renace/calamares/$nombre" "$ruta"
+    chmod 755 "$ruta"
+    echo "Renace: sustituido $ruta"
 done
 
 # ── Identidad ────────────────────────────────────────────────
