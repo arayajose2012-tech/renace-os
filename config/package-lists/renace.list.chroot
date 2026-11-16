@@ -1,4 +1,9 @@
 # ── Sistema base ─────────────────────────────────────────────
+# user-setup crea el usuario "user" del modo de prueba (live); sin él no se
+# puede iniciar sesión al arrancar desde el USB.
+user-setup
+live-tools
+uuid-runtime
 sudo
 locales
 console-setup
