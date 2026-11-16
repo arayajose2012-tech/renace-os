@@ -1,0 +1,4 @@
+#!/bin/sh
+# Versión de Renace OS: el medio no lleva repositorio de paquetes porque
+# todo lo necesario para arrancar ya está instalado en la imagen.
+exit 0

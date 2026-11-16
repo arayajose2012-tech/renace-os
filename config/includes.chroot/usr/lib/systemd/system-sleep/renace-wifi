@@ -1,0 +1,6 @@
+#!/bin/sh
+# Al despertar de la suspensión, comprobar que el Wi-Fi ha vuelto.
+if [ "$1" = post ]; then
+    /usr/local/sbin/renace-wifi reanudar >/dev/null 2>&1 &
+fi
+exit 0

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Primera sesión de cada usuario: aplica el aspecto de Renace y da la bienvenida.
+MARCA="$HOME/.config/renace/listo"
+[ -f "$MARCA" ] && exit 0
+mkdir -p "$(dirname "$MARCA")"
+sleep 3   # dejar que el escritorio termine de arrancar
+/usr/local/bin/renace-apariencia inicial
+touch "$MARCA"
+exec /usr/local/bin/renace-centro --bienvenida

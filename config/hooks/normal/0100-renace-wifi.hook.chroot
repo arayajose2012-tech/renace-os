@@ -1,0 +1,36 @@
+#!/bin/sh
+# Deja el controlador Broadcom "wl" compilado dentro de la imagen y verifica
+# que realmente está: sin él, la ISO no cumple su propósito y la compilación falla.
+set -e
+
+# El paquete broadcom-sta-dkms trae una lista negra fija que impide usar b43 y
+# brcmsmac. En Renace OS esa decisión la toma renace-wifi según el chip detectado.
+if [ -f /etc/modprobe.d/broadcom-sta-dkms.conf ]; then
+    echo "# Vaciado por Renace OS: los controladores los elige renace-wifi" \
+        > /etc/modprobe.d/broadcom-sta-dkms.conf
+fi
+
+encontrado=0
+for dir in /lib/modules/*; do
+    kver=$(basename "$dir")
+    [ -e "$dir/build" ] || continue
+    echo "Renace: compilando módulos DKMS para el kernel $kver"
+    dkms autoinstall -k "$kver" || true
+    depmod -a "$kver" || true
+    if find "$dir" -name 'wl.ko*' | grep -q .; then
+        encontrado=1
+        echo "Renace: controlador wl presente para $kver"
+    fi
+done
+
+if [ "$encontrado" != 1 ]; then
+    echo "ERROR Renace: el controlador Broadcom wl no se compiló." >&2
+    dkms status >&2 || true
+    exit 1
+fi
+
+if [ -d /lib/firmware/b43 ]; then
+    echo "Renace: firmware b43 presente"
+else
+    echo "AVISO Renace: falta el firmware b43; los chips BCM43xx usarán solo wl."
+fi

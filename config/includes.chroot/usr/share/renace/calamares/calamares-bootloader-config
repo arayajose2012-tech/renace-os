@@ -1,0 +1,18 @@
+#!/bin/sh
+# Versión de Renace OS: no usa apt (el Mac puede no tener red todavía).
+# GRUB ya viene en la imagen; lo instala el módulo "bootloader" de Calamares.
+CHROOT=$(mount | grep proc | grep calamares | awk '{print $3}' | sed -e "s#/proc##g")
+[ -n "$CHROOT" ] || exit 0
+
+# Disco cifrado: proteger el initramfs, como hace el ayudante original
+if mount | grep -q "/dev/mapper/luks"; then
+    mkdir -p "$CHROOT/etc/initramfs-tools/conf.d"
+    echo "UMASK=0077" > "$CHROOT/etc/initramfs-tools/conf.d/initramfs-permissions"
+fi
+
+# Detectar macOS u otros sistemas ya instalados en el disco
+if [ -f "$CHROOT/etc/default/grub" ]; then
+    sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' \
+        "$CHROOT/etc/default/grub"
+fi
+exit 0

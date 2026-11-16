@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""Centro Renace — panel de control amigable de Renace OS.
+
+Todo lo que normalmente exigiría una terminal (controlador Wi-Fi, aspecto del
+escritorio, modo servidor/NAS) se hace aquí con botones. Solo consume memoria
+mientras la ventana está abierta.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+WIFI = "/usr/local/sbin/renace-wifi"
+MODO = "/usr/local/sbin/renace-mode"
+APARIENCIA = "/usr/local/bin/renace-apariencia"
+CANCELADO = (126, 127)  # el usuario cerró la ventana de contraseña
+
+
+def ejecutar(orden, entrada=None):
+    """Ejecuta una orden y devuelve (código, texto)."""
+    try:
+        p = subprocess.run(orden, input=entrada, capture_output=True, text=True)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except OSError as error:
+        return 1, str(error)
+
+
+def memoria():
+    datos = {}
+    with open("/proc/meminfo") as f:
+        for linea in f:
+            clave, valor = linea.split(":", 1)
+            datos[clave] = int(valor.split()[0]) // 1024
+    total = datos.get("MemTotal", 0)
+    usada = total - datos.get("MemAvailable", 0)
+    return usada, total
+
+
+def leer_estado_modo():
+    _, texto = ejecutar([MODO, "estado"])
+    estado = {}
+    for linea in texto.splitlines():
+        if "=" in linea:
+            clave, valor = linea.split("=", 1)
+            estado[clave.strip()] = valor.strip()
+    return estado
+
+
+class Centro(Gtk.Window):
+    def __init__(self, bienvenida=False):
+        super().__init__(title="Centro Renace")
+        self.set_default_size(800, 540)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_icon_name("preferences-system")
+
+        caja = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.add(caja)
+        self.pila = Gtk.Stack()
+        self.pila.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        lateral = Gtk.StackSidebar()
+        lateral.set_stack(self.pila)
+        lateral.set_size_request(170, -1)
+        caja.pack_start(lateral, False, False, 0)
+        caja.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        caja.pack_start(self.pila, True, True, 0)
+
+        self.pila.add_titled(self.pagina_inicio(bienvenida), "inicio", "Inicio")
+        self.pila.add_titled(self.pagina_wifi(), "wifi", "Wi-Fi")
+        self.pila.add_titled(self.pagina_apariencia(), "apariencia", "Apariencia")
+        self.pila.add_titled(self.pagina_servidor(), "servidor", "Modo servidor")
+
+        self.refrescar_wifi()
+        self.refrescar_servidor()
+        self.refrescar_inicio()
+        GLib.timeout_add_seconds(3, self.refrescar_inicio)
+
+    # ── utilidades de interfaz ──────────────────────────────
+    def pagina(self, titulo, subtitulo):
+        caja = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        caja.set_border_width(24)
+        t = Gtk.Label(xalign=0)
+        t.set_markup(f"<span size='x-large' weight='bold'>{titulo}</span>")
+        s = Gtk.Label(label=subtitulo, xalign=0)
+        s.set_line_wrap(True)
+        s.get_style_context().add_class("dim-label")
+        caja.pack_start(t, False, False, 0)
+        caja.pack_start(s, False, False, 0)
+        return caja
+
+    def boton(self, texto, accion, destacado=False):
+        b = Gtk.Button(label=texto)
+        if destacado:
+            b.get_style_context().add_class("suggested-action")
+        b.connect("clicked", lambda _b: accion())
+        return b
+
+    def fila(self, *elementos):
+        f = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for e in elementos:
+            f.pack_start(e, False, False, 0)
+        return f
+
+    def aviso(self, texto, error=False):
+        tipo = Gtk.MessageType.ERROR if error else Gtk.MessageType.INFO
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=tipo,
+                              buttons=Gtk.ButtonsType.OK, text=texto)
+        d.run()
+        d.destroy()
+
+    def tarea(self, orden, al_terminar=None, admin=False, entrada=None):
+        """Ejecuta una orden sin congelar la ventana."""
+        if admin:
+            orden = ["pkexec"] + orden
+        self.set_sensitive(False)
+
+        def fin(codigo, texto):
+            self.set_sensitive(True)
+            if al_terminar:
+                al_terminar(codigo, texto)
+            return False
+
+        def hilo():
+            codigo, texto = ejecutar(orden, entrada)
+            GLib.idle_add(fin, codigo, texto)
+
+        threading.Thread(target=hilo, daemon=True).start()
+
+    def lanzar(self, *candidatos):
+        """Abre el primer programa disponible de la lista."""
+        for orden in candidatos:
+            if shutil.which(orden[0]):
+                subprocess.Popen(orden)
+                return
+        self.aviso("Ese programa no está instalado.", error=True)
+
+    # ── Inicio ──────────────────────────────────────────────
+    def pagina_inicio(self, bienvenida):
+        titulo = "Te damos la bienvenida a Renace OS" if bienvenida else "Renace OS"
+        p = self.pagina(titulo, "Un sistema ligero para darle una segunda vida a tu Mac. "
+                                "Desde aquí puedes ajustarlo todo sin usar la terminal.")
+        self.barra_ram = Gtk.ProgressBar(show_text=True)
+        self.etq_resumen = Gtk.Label(xalign=0)
+        self.etq_resumen.set_line_wrap(True)
+        p.pack_start(self.barra_ram, False, False, 0)
+        p.pack_start(self.etq_resumen, False, False, 0)
+        p.pack_start(Gtk.Separator(), False, False, 6)
+        p.pack_start(self.fila(
+            self.boton("Instalar aplicaciones", lambda: self.lanzar(
+                ["gnome-software"], ["synaptic-pkexec"])),
+            self.boton("Actualizar el sistema", lambda: self.lanzar(
+                ["xfce4-terminal", "--hold", "-T", "Actualizar Renace OS", "-x",
+                 "sudo", "sh", "-c", "apt update && apt -y full-upgrade"])),
+            self.boton("Conectar a una red", lambda: self.lanzar(
+                ["nm-connection-editor"])),
+        ), False, False, 0)
+        if os.path.exists("/run/live/medium") and shutil.which("calamares"):
+            aviso = Gtk.Label(xalign=0)
+            aviso.set_line_wrap(True)
+            aviso.set_markup("<b>Estás probando Renace OS desde el USB.</b> Nada se ha cambiado "
+                             "en tu Mac. Si el Wi-Fi y todo lo demás funcionan, puedes instalarlo.")
+            p.pack_start(aviso, False, False, 6)
+            p.pack_start(self.fila(self.boton(
+                "Instalar Renace OS en este Mac",
+                lambda: self.lanzar(["calamares-install-debian"], ["pkexec", "calamares"]),
+                destacado=True)), False, False, 0)
+        return p
+
+    def refrescar_inicio(self):
+        usada, total = memoria()
+        if total:
+            self.barra_ram.set_fraction(min(usada / total, 1.0))
+            self.barra_ram.set_text(f"Memoria en uso: {usada} MB de {total} MB")
+        return True
+
+    # ── Wi-Fi ───────────────────────────────────────────────
+    def pagina_wifi(self):
+        p = self.pagina("Wi-Fi", "Renace OS detecta el chip Wi-Fi de tu Mac y elige el "
+                                 "controlador adecuado. Si la conexión falla, prueba «Reparar».")
+        self.etq_wifi = Gtk.Label(xalign=0, selectable=True)
+        self.etq_wifi.set_line_wrap(True)
+        marco = Gtk.Frame()
+        self.etq_wifi.set_margin_top(10)
+        self.etq_wifi.set_margin_bottom(10)
+        self.etq_wifi.set_margin_start(12)
+        self.etq_wifi.set_margin_end(12)
+        marco.add(self.etq_wifi)
+        p.pack_start(marco, False, False, 0)
+
+        p.pack_start(self.fila(
+            self.boton("Reparar Wi-Fi", self.wifi_reparar, destacado=True),
+            self.boton("Guardar informe de diagnóstico", self.wifi_informe),
+        ), False, False, 0)
+
+        p.pack_start(Gtk.Separator(), False, False, 6)
+        p.pack_start(Gtk.Label(label="Controlador (solo si el automático no va bien):",
+                               xalign=0), False, False, 0)
+        self.combo_wifi = Gtk.ComboBoxText()
+        p.pack_start(self.fila(self.combo_wifi,
+                               self.boton("Usar este controlador", self.wifi_usar)),
+                     False, False, 0)
+        ayuda = Gtk.Label(xalign=0)
+        ayuda.set_line_wrap(True)
+        ayuda.get_style_context().add_class("dim-label")
+        ayuda.set_markup("<small>¿Sin Wi-Fi todavía? Conecta un iPhone o Android por cable USB "
+                         "y activa «Compartir Internet»: funciona al instante.</small>")
+        p.pack_start(ayuda, False, False, 6)
+        return p
+
+    def refrescar_wifi(self):
+        _, texto = ejecutar([WIFI, "estado"])
+        visibles, opciones = [], []
+        for linea in texto.splitlines():
+            if linea.startswith("Opciones:"):
+                opciones = linea.split(":", 1)[1].split()
+            else:
+                visibles.append(linea)
+        self.etq_wifi.set_text("\n".join(visibles) or "No se pudo consultar el Wi-Fi.")
+        self.combo_wifi.remove_all()
+        self.combo_wifi.append("auto", "Automático (recomendado)")
+        nombres = {"wl": "wl — oficial de Broadcom", "b43": "b43 — libre",
+                   "brcmsmac": "brcmsmac — libre, del kernel",
+                   "brcmfmac": "brcmfmac — libre, del kernel"}
+        for o in opciones:
+            self.combo_wifi.append(o, nombres.get(o, o))
+        self.combo_wifi.set_active_id("auto")
+        self.resumen()
+
+    def tras_wifi(self, codigo, texto):
+        self.refrescar_wifi()
+        if codigo in CANCELADO:
+            return
+        ultima = texto.splitlines()[-1] if texto else ""
+        self.aviso(ultima or "Hecho.", error=codigo != 0)
+
+    def wifi_reparar(self):
+        self.tarea([WIFI, "reparar"], self.tras_wifi, admin=True)
+
+    def wifi_usar(self):
+        eleccion = self.combo_wifi.get_active_id() or "auto"
+        self.tarea([WIFI, "usar", eleccion], self.tras_wifi, admin=True)
+
+    def wifi_informe(self):
+        destino = os.path.join(GLib.get_home_dir(), "informe-wifi-renace.txt")
+
+        def guardar(_codigo, texto):
+            with open(destino, "w") as f:
+                f.write(texto + "\n")
+            self.aviso(f"Informe guardado en:\n{destino}\n\n"
+                       "Adjúntalo cuando pidas ayuda en un foro.")
+        self.tarea([WIFI, "informe"], guardar)
+
+    # ── Apariencia ──────────────────────────────────────────
+    def pagina_apariencia(self):
+        p = self.pagina("Apariencia", "Elige cómo quieres que se vea tu escritorio. "
+                                      "Puedes cambiarlo las veces que quieras.")
+
+        def aplicar(*args):
+            self.tarea([APARIENCIA] + list(args))
+
+        p.pack_start(Gtk.Label(label="Disposición del escritorio", xalign=0), False, False, 0)
+        p.pack_start(self.fila(
+            self.boton("Estilo Mac (barra arriba + dock)", lambda: aplicar("disposicion", "mac")),
+            self.boton("Estilo clásico (barra abajo)", lambda: aplicar("disposicion", "clasica")),
+        ), False, False, 0)
+
+        p.pack_start(Gtk.Label(label="Colores", xalign=0), False, False, 0)
+        p.pack_start(self.fila(
+            self.boton("Tema claro", lambda: aplicar("tema", "claro")),
+            self.boton("Tema oscuro", lambda: aplicar("tema", "oscuro")),
+        ), False, False, 0)
+
+        p.pack_start(Gtk.Label(label="Efectos visuales (sombras y transparencias). "
+                                     "Desactívalos en Macs muy antiguos para ganar fluidez.",
+                               xalign=0, wrap=True), False, False, 0)
+        p.pack_start(self.fila(
+            self.boton("Activar efectos", lambda: aplicar("efectos", "si")),
+            self.boton("Desactivar efectos", lambda: aplicar("efectos", "no")),
+        ), False, False, 0)
+
+        p.pack_start(Gtk.Separator(), False, False, 6)
+        p.pack_start(self.fila(
+            self.boton("Fondo de pantalla…", lambda: self.lanzar(["xfdesktop-settings"])),
+            self.boton("Temas e iconos…", lambda: self.lanzar(["xfce4-appearance-settings"])),
+            self.boton("Todos los ajustes…", lambda: self.lanzar(["xfce4-settings-manager"])),
+        ), False, False, 0)
+        return p
+
+    # ── Modo servidor ───────────────────────────────────────
+    def pagina_servidor(self):
+        p = self.pagina("Modo servidor", "Convierte este Mac en un mini servidor encendido 24/7: "
+                                         "no se suspende aunque cierres la tapa, apaga la pantalla "
+                                         "y reduce el consumo de energía.")
+        self.etq_modo = Gtk.Label(xalign=0, selectable=True)
+        self.etq_modo.set_line_wrap(True)
+        p.pack_start(self.etq_modo, False, False, 0)
+
+        self.op_nas = Gtk.CheckButton(
+            label="NAS: carpeta compartida en la red (también sirve para Time Machine)")
+        self.op_docker = Gtk.CheckButton(
+            label="Contenedores Docker (bots de trading, automatizaciones, servicios propios)")
+        self.op_cockpit = Gtk.CheckButton(
+            label="Panel web de administración (Cockpit, desde otro equipo)")
+        self.op_sin_escritorio = Gtk.CheckButton(
+            label="Arrancar sin escritorio (ahorra unos 300 MB de RAM; se aplica al reiniciar)")
+        self.op_autoencendido = Gtk.CheckButton(
+            label="Encenderse solo cuando vuelve la luz tras un corte (experimental)")
+        for op in (self.op_nas, self.op_docker, self.op_cockpit,
+                   self.op_sin_escritorio, self.op_autoencendido):
+            p.pack_start(op, False, False, 0)
+
+        self.clave_nas = Gtk.Entry(visibility=False, width_chars=24)
+        self.clave_nas.set_placeholder_text("Contraseña para la carpeta compartida")
+        p.pack_start(self.fila(Gtk.Label(label="Contraseña del NAS:"), self.clave_nas),
+                     False, False, 0)
+
+        p.pack_start(Gtk.Separator(), False, False, 6)
+        p.pack_start(self.fila(
+            self.boton("Activar / actualizar modo servidor", self.servidor_activar, destacado=True),
+            self.boton("Volver a modo escritorio", self.servidor_desactivar),
+        ), False, False, 0)
+        return p
+
+    def refrescar_servidor(self):
+        e = leer_estado_modo()
+        self.estado_modo = e
+        activo = e.get("modo") == "servidor"
+        self.op_nas.set_active(e.get("nas") == "1")
+        self.op_docker.set_active(e.get("docker") == "1")
+        self.op_cockpit.set_active(e.get("cockpit") == "1")
+        self.op_sin_escritorio.set_active(e.get("sinescritorio") == "1")
+        self.op_autoencendido.set_active(e.get("autoencendido") == "1")
+
+        if not activo:
+            self.etq_modo.set_markup("Estado: <b>modo escritorio</b> (uso normal).")
+        else:
+            ip, equipo, usuario = e.get("ip", "?"), e.get("equipo", "?"), e.get("usuario", "?")
+            lineas = ["Estado: <b>modo servidor activo</b>.",
+                      f"Acceso remoto (SSH):  <tt>ssh {usuario}@{ip}</tt>"]
+            if e.get("nas") == "1":
+                lineas.append(f"Carpeta compartida:  <tt>smb://{equipo}.local/nas</tt>  "
+                              f"(en Windows: <tt>\\\\{ip}\\nas</tt>)")
+            if e.get("cockpit") == "1":
+                lineas.append(f"Panel web:  <tt>https://{ip}:9090</tt>")
+            self.etq_modo.set_markup("\n".join(lineas))
+        self.resumen()
+
+    def resumen(self):
+        modo = getattr(self, "estado_modo", {}).get("modo", "escritorio")
+        wifi = self.etq_wifi.get_text().splitlines()[:2] if hasattr(self, "etq_wifi") else []
+        self.etq_resumen.set_text("\n".join([f"Modo actual: {modo}"] + wifi))
+
+    def energia_usuario(self, servidor):
+        """Ajustes de energía de la sesión gráfica (no necesitan contraseña)."""
+        canal = ["xfconf-query", "-c", "xfce4-power-manager", "-p"]
+        base = "/xfce4-power-manager/"
+        if servidor:
+            for prop, tipo, valor in (
+                    ("inactivity-on-ac", "uint", "14"), ("inactivity-on-battery", "uint", "14"),
+                    ("lid-action-on-ac", "uint", "0"), ("lid-action-on-battery", "uint", "0"),
+                    ("logind-handle-lid-switch", "bool", "true")):
+                ejecutar(canal + [base + prop, "-n", "-t", tipo, "-s", valor])
+        else:
+            for prop in ("inactivity-on-ac", "inactivity-on-battery", "lid-action-on-ac",
+                         "lid-action-on-battery", "logind-handle-lid-switch"):
+                ejecutar(canal + [base + prop, "-r"])
+
+    def servidor_activar(self):
+        clave = self.clave_nas.get_text()
+        quiere_nas = self.op_nas.get_active()
+        ya_tenia_nas = self.estado_modo.get("nas") == "1"
+        if quiere_nas and not ya_tenia_nas and not clave:
+            self.aviso("Escribe una contraseña para la carpeta compartida del NAS.", error=True)
+            return
+
+        orden = [MODO, "servidor"]
+        for opcion, bandera in ((self.op_nas, "--nas"), (self.op_docker, "--docker"),
+                                (self.op_cockpit, "--cockpit"),
+                                (self.op_sin_escritorio, "--sin-escritorio"),
+                                (self.op_autoencendido, "--autoencendido")):
+            if opcion.get_active():
+                orden.append(bandera)
+
+        def tras_clave(codigo, texto):
+            self.clave_nas.set_text("")
+            self.refrescar_servidor()
+            if codigo != 0:
+                self.aviso("El modo servidor está activo, pero no se pudo guardar la "
+                           f"contraseña del NAS:\n{texto}", error=True)
+            else:
+                self.aviso("Modo servidor activado. Ya puedes cerrar la tapa: "
+                           "el equipo seguirá encendido.")
+
+        def tras_activar(codigo, texto):
+            if codigo in CANCELADO:
+                return
+            if codigo != 0:
+                self.refrescar_servidor()
+                self.aviso(f"No se pudo activar el modo servidor:\n{texto}", error=True)
+                return
+            self.energia_usuario(True)
+            if quiere_nas and clave:
+                self.tarea([MODO, "nas-clave"], tras_clave, admin=True, entrada=clave + "\n")
+            else:
+                tras_clave(0, "")
+
+        self.tarea(orden, tras_activar, admin=True)
+
+    def servidor_desactivar(self):
+        def fin(codigo, texto):
+            if codigo in CANCELADO:
+                return
+            if codigo == 0:
+                self.energia_usuario(False)
+            self.refrescar_servidor()
+            self.aviso("Modo escritorio activado." if codigo == 0 else texto, error=codigo != 0)
+        self.tarea([MODO, "escritorio"], fin, admin=True)
+
+
+def main():
+    ventana = Centro(bienvenida="--bienvenida" in sys.argv)
+    ventana.connect("destroy", Gtk.main_quit)
+    ventana.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

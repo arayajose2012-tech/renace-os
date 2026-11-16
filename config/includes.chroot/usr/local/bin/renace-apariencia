@@ -1,0 +1,177 @@
+#!/bin/bash
+# renace-apariencia — cambia el aspecto del escritorio con una sola orden.
+# Se ejecuta como el usuario normal (no necesita contraseña).
+#
+#   renace-apariencia disposicion mac|clasica
+#   renace-apariencia tema claro|oscuro
+#   renace-apariencia efectos si|no
+#   renace-apariencia inicial
+set -u
+
+xq() {  # canal propiedad tipo valor
+    xfconf-query -c "$1" -p "$2" -n -t "$3" -s "$4" 2>/dev/null
+}
+
+# ── Paneles ──────────────────────────────────────────────────
+complemento() {  # id tipo
+    xq xfce4-panel "/plugins/plugin-$1" string "$2"
+}
+
+separador() {  # id expandir(true|false)
+    complemento "$1" separator
+    xq xfce4-panel "/plugins/plugin-$1/expand" bool "$2"
+    xq xfce4-panel "/plugins/plugin-$1/style" uint 0
+}
+
+lanzador() {  # id archivo.desktop  → devuelve 1 si la aplicación no existe
+    local origen="/usr/share/applications/$2"
+    local destino="$HOME/.config/xfce4/panel/launcher-$1"
+    [ -f "$origen" ] || return 1
+    mkdir -p "$destino"
+    cp "$origen" "$destino/$2"
+    complemento "$1" launcher
+    xfconf-query -c xfce4-panel -p "/plugins/plugin-$1/items" -n -a -t string -s "$2" 2>/dev/null
+}
+
+lista_ids() {  # propiedad id id id…
+    local prop=$1 args=()
+    shift
+    for id in "$@"; do args+=(-t int -s "$id"); done
+    xfconf-query -c xfce4-panel -p "$prop" -n -a "${args[@]}" 2>/dev/null
+}
+
+panel() {  # número posición tamaño largo(%)
+    xq xfce4-panel "/panels/panel-$1/position" string "$2"
+    xq xfce4-panel "/panels/panel-$1/position-locked" bool true
+    xq xfce4-panel "/panels/panel-$1/size" uint "$3"
+    xq xfce4-panel "/panels/panel-$1/length" uint "$4"
+}
+
+limpiar_paneles() {
+    xfce4-panel --quit >/dev/null 2>&1
+    sleep 1
+    xfconf-query -c xfce4-panel -p /panels -r -R 2>/dev/null
+    xfconf-query -c xfce4-panel -p /plugins -r -R 2>/dev/null
+    rm -rf "$HOME"/.config/xfce4/panel/launcher-*
+}
+
+arrancar_paneles() {
+    if pgrep -x xfce4-panel >/dev/null; then
+        xfce4-panel --restart >/dev/null 2>&1 &
+    else
+        nohup xfce4-panel >/dev/null 2>&1 &
+    fi
+}
+
+# Estilo Mac: barra fina arriba y un dock de aplicaciones abajo
+disposicion_mac() {
+    limpiar_paneles
+    lista_ids /panels 1 2
+
+    panel 1 "p=6;x=0;y=0" 28 100
+    complemento 1 whiskermenu
+    separador 2 true
+    complemento 3 systray
+    complemento 4 pulseaudio
+    complemento 5 power-manager-plugin
+    complemento 6 notification-plugin
+    complemento 7 clock
+    lista_ids /panels/panel-1/plugin-ids 1 2 3 4 5 6 7
+
+    panel 2 "p=10;x=0;y=0" 48 1
+    xq xfce4-panel /panels/panel-2/length-adjust bool true
+    local dock=() id=20 app
+    for app in firefox-esr.desktop thunar.desktop libreoffice-writer.desktop \
+               xfce4-terminal.desktop renace-centro.desktop; do
+        if lanzador $id "$app"; then dock+=("$id"); id=$((id + 1)); fi
+    done
+    separador 30 false
+    complemento 31 tasklist
+    xq xfce4-panel /plugins/plugin-31/show-labels bool false
+    lista_ids /panels/panel-2/plugin-ids "${dock[@]}" 30 31
+
+    arrancar_paneles
+}
+
+# Estilo clásico: una sola barra abajo, como en Windows
+disposicion_clasica() {
+    limpiar_paneles
+    lista_ids /panels 1
+
+    panel 1 "p=8;x=0;y=0" 36 100
+    complemento 1 whiskermenu
+    local ids=(1) id=20 app
+    for app in firefox-esr.desktop thunar.desktop; do
+        if lanzador $id "$app"; then ids+=("$id"); id=$((id + 1)); fi
+    done
+    complemento 2 tasklist
+    xq xfce4-panel /plugins/plugin-2/show-labels bool true
+    separador 3 true
+    complemento 4 systray
+    complemento 5 pulseaudio
+    complemento 6 power-manager-plugin
+    complemento 7 notification-plugin
+    complemento 8 clock
+    complemento 9 showdesktop
+    lista_ids /panels/panel-1/plugin-ids "${ids[@]}" 2 3 4 5 6 7 8 9
+
+    arrancar_paneles
+}
+
+# ── Temas ────────────────────────────────────────────────────
+tema() {
+    local gtk iconos ventanas esquema
+    if [ "$1" = oscuro ]; then
+        gtk=Adwaita-dark; iconos=Adwaita; ventanas=Default; esquema=prefer-dark
+        [ -d /usr/share/themes/Arc-Dark ] && { gtk=Arc-Dark; ventanas=Arc-Dark; }
+        [ -d /usr/share/icons/Papirus-Dark ] && iconos=Papirus-Dark
+    else
+        gtk=Adwaita; iconos=Adwaita; ventanas=Default; esquema=prefer-light
+        [ -d /usr/share/themes/Arc ] && { gtk=Arc; ventanas=Arc; }
+        [ -d /usr/share/icons/Papirus ] && iconos=Papirus
+    fi
+    xq xsettings /Net/ThemeName string "$gtk"
+    xq xsettings /Net/IconThemeName string "$iconos"
+    xq xfwm4 /general/theme string "$ventanas"
+    gsettings set org.gnome.desktop.interface color-scheme "$esquema" 2>/dev/null
+    gsettings set org.gnome.desktop.interface gtk-theme "$gtk" 2>/dev/null
+}
+
+efectos() {
+    if [ "$1" = si ]; then
+        xq xfwm4 /general/use_compositing bool true
+    else
+        xq xfwm4 /general/use_compositing bool false
+    fi
+}
+
+case "${1:-}" in
+    disposicion)
+        case "${2:-}" in
+            mac) disposicion_mac ;;
+            clasica) disposicion_clasica ;;
+            *) echo "Uso: renace-apariencia disposicion mac|clasica" >&2; exit 2 ;;
+        esac
+        ;;
+    tema)
+        case "${2:-}" in
+            claro|oscuro) tema "$2" ;;
+            *) echo "Uso: renace-apariencia tema claro|oscuro" >&2; exit 2 ;;
+        esac
+        ;;
+    efectos)
+        case "${2:-}" in
+            si|no) efectos "$2" ;;
+            *) echo "Uso: renace-apariencia efectos si|no" >&2; exit 2 ;;
+        esac
+        ;;
+    inicial)
+        tema claro
+        # No guardar sesiones: arranque más rápido y sin sorpresas
+        xq xfce4-session /general/SaveOnExit bool false
+        disposicion_mac
+        ;;
+    *)
+        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+esac

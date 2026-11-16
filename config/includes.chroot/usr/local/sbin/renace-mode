@@ -1,0 +1,309 @@
+#!/bin/bash
+# renace-mode — cambia el Mac entre uso de escritorio y mini servidor / NAS.
+#
+# Modo servidor: no se suspende nunca (ni al cerrar la tapa), apaga la pantalla,
+# ajusta la energía para estar encendido 24/7 y activa los servicios elegidos.
+set -u
+PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+DIR=/etc/renace
+MODO=$DIR/modo
+CONF=$DIR/servidor.conf
+NAS_DIR=/srv/nas
+NAS_CONF=/etc/samba/renace-nas.conf
+SMB_CONF=/etc/samba/smb.conf
+
+F_LOGIND=/etc/systemd/logind.conf.d/50-renace-servidor.conf
+F_SYSCTL=/etc/sysctl.d/91-renace-servidor.conf
+F_NM=/etc/NetworkManager/conf.d/50-renace-servidor.conf
+F_TLP=/etc/tlp.d/50-renace-servidor.conf
+F_APT=/etc/apt/apt.conf.d/20auto-upgrades
+SUSPENSION="sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+
+exigir_root() {
+    if [ "$(id -u)" != 0 ]; then
+        echo "Esta acción necesita permisos de administrador (use sudo)." >&2
+        exit 1
+    fi
+}
+
+usuario_principal() {
+    if [ -n "${PKEXEC_UID:-}" ]; then
+        id -nu "$PKEXEC_UID" && return
+    fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        echo "$SUDO_USER" && return
+    fi
+    getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1; exit}'
+}
+
+existe_unidad() { systemctl list-unit-files "$1" 2>/dev/null | grep -q "^$1"; }
+
+# ── Base del modo servidor ───────────────────────────────────
+base_activar() {
+    mkdir -p "$(dirname "$F_LOGIND")" "$(dirname "$F_TLP")" "$(dirname "$F_NM")"
+
+    # 1. Nunca suspender: ni por inactividad, ni por la tapa, ni por el botón
+    cat > "$F_LOGIND" <<'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+IdleAction=ignore
+EOF
+    systemctl kill -s HUP systemd-logind 2>/dev/null   # recarga sin cerrar la sesión
+    # shellcheck disable=SC2086
+    systemctl mask $SUSPENSION >/dev/null 2>&1
+
+    # 2. Si el kernel se cuelga, reiniciar solo en vez de quedarse muerto
+    cat > "$F_SYSCTL" <<'EOF'
+kernel.panic = 10
+EOF
+    sysctl -q -p "$F_SYSCTL" 2>/dev/null
+
+    # 3. Red estable: el ahorro de energía del Wi-Fi corta conexiones entrantes.
+    #    Además se deja activado el encendido por red (Wake-on-LAN) en el cable.
+    cat > "$F_NM" <<'EOF'
+[connection]
+wifi.powersave = 2
+ethernet.wake-on-lan = 64
+EOF
+    systemctl reload NetworkManager 2>/dev/null
+    for i in /sys/class/net/*; do
+        [ -d "$i/wireless" ] && iw dev "$(basename "$i")" set power_save off 2>/dev/null
+    done
+
+    # 4. Energía: bajo consumo en reposo sin perder respuesta
+    local gobernador=schedutil
+    if grep -qs intel_pstate /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver; then
+        gobernador=powersave
+    fi
+    cat > "$F_TLP" <<EOF
+# Renace OS — perfil de servidor 24/7
+TLP_ENABLE=1
+CPU_SCALING_GOVERNOR_ON_AC=$gobernador
+CPU_SCALING_GOVERNOR_ON_BAT=$gobernador
+CPU_ENERGY_PERF_POLICY_ON_AC=balance_power
+CPU_ENERGY_PERF_POLICY_ON_BAT=balance_power
+SATA_LINKPWR_ON_AC="med_power_with_dipm"
+RUNTIME_PM_ON_AC=auto
+USB_AUTOSUSPEND=1
+WIFI_PWR_ON_AC=off
+WIFI_PWR_ON_BAT=off
+WOL_DISABLE=N
+EOF
+    tlp start >/dev/null 2>&1
+
+    # 5. Pantalla apagada con la tapa cerrada / consola en reposo
+    systemctl enable --now renace-pantalla.service >/dev/null 2>&1
+
+    # 6. Parches de seguridad automáticos
+    cat > "$F_APT" <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+    # 7. Acceso remoto por SSH y cortafuegos
+    systemctl enable --now ssh.service >/dev/null 2>&1
+    ufw allow 22/tcp >/dev/null 2>&1
+    ufw --force enable >/dev/null 2>&1
+}
+
+base_desactivar() {
+    rm -f "$F_LOGIND" "$F_SYSCTL" "$F_NM" "$F_TLP" "$F_APT"
+    systemctl kill -s HUP systemd-logind 2>/dev/null
+    # shellcheck disable=SC2086
+    systemctl unmask $SUSPENSION >/dev/null 2>&1
+    sysctl -q -w kernel.panic=0 2>/dev/null
+    systemctl reload NetworkManager 2>/dev/null
+    tlp start >/dev/null 2>&1
+    systemctl disable --now renace-pantalla.service >/dev/null 2>&1
+    systemctl disable --now ssh.service >/dev/null 2>&1
+    ufw --force disable >/dev/null 2>&1
+}
+
+# ── NAS: carpeta compartida para Mac, Windows y Linux ────────
+nas_activar() {
+    local usuario=$1
+    mkdir -p "$NAS_DIR/timemachine"
+    getent group sambashare >/dev/null || groupadd sambashare
+    [ -n "$usuario" ] && usermod -aG sambashare "$usuario"
+    chgrp -R sambashare "$NAS_DIR"
+    chmod 2775 "$NAS_DIR" "$NAS_DIR/timemachine"
+
+    cat > "$NAS_CONF" <<EOF
+# Renace OS — carpetas compartidas del NAS
+[nas]
+   comment = Almacenamiento de Renace
+   path = $NAS_DIR
+   browseable = yes
+   read only = no
+   valid users = @sambashare
+   force group = sambashare
+   create mask = 0664
+   directory mask = 2775
+   veto files = /timemachine/
+   vfs objects = catia fruit streams_xattr
+
+[timemachine]
+   comment = Copias de seguridad de Time Machine
+   path = $NAS_DIR/timemachine
+   browseable = yes
+   read only = no
+   valid users = @sambashare
+   force group = sambashare
+   vfs objects = catia fruit streams_xattr
+   fruit:time machine = yes
+EOF
+    grep -qsF "include = $NAS_CONF" "$SMB_CONF" || \
+        printf '\ninclude = %s\n' "$NAS_CONF" >> "$SMB_CONF"
+
+    systemctl enable smbd.service nmbd.service avahi-daemon.service >/dev/null 2>&1
+    systemctl restart smbd.service nmbd.service avahi-daemon.service >/dev/null 2>&1
+    ufw allow 445/tcp >/dev/null 2>&1
+    ufw allow 139/tcp >/dev/null 2>&1
+    ufw allow 137:138/udp >/dev/null 2>&1
+    ufw allow 5353/udp >/dev/null 2>&1
+}
+
+nas_desactivar() {
+    systemctl disable --now smbd.service nmbd.service >/dev/null 2>&1
+    if [ -f "$SMB_CONF" ]; then
+        grep -vF "include = $NAS_CONF" "$SMB_CONF" > "$SMB_CONF.renace" && \
+            cat "$SMB_CONF.renace" > "$SMB_CONF"
+        rm -f "$SMB_CONF.renace"
+    fi
+    rm -f "$NAS_CONF"
+    ufw delete allow 445/tcp >/dev/null 2>&1
+    ufw delete allow 139/tcp >/dev/null 2>&1
+    ufw delete allow 137:138/udp >/dev/null 2>&1
+    # Los archivos de /srv/nas NO se borran nunca.
+}
+
+# ── Contenedores (bots de trading, automatizaciones, etc.) ───
+docker_activar() {
+    local usuario=$1
+    existe_unidad docker.service || { echo "Docker no está instalado."; return 1; }
+    systemctl enable --now docker.service >/dev/null 2>&1
+    [ -n "$usuario" ] && usermod -aG docker "$usuario"
+}
+docker_desactivar() {
+    systemctl disable --now docker.service docker.socket containerd.service >/dev/null 2>&1
+}
+
+# ── Panel web de administración (https://equipo:9090) ────────
+cockpit_activar() {
+    existe_unidad cockpit.socket || { echo "Cockpit no está instalado."; return 1; }
+    systemctl enable --now cockpit.socket >/dev/null 2>&1
+    ufw allow 9090/tcp >/dev/null 2>&1
+}
+cockpit_desactivar() {
+    systemctl disable --now cockpit.socket >/dev/null 2>&1
+    ufw delete allow 9090/tcp >/dev/null 2>&1
+}
+
+# ── Órdenes ──────────────────────────────────────────────────
+modo_servidor() {
+    local nas=0 docker=0 cockpit=0 sinescritorio=0 autoencendido=0 usuario
+    for arg in "$@"; do
+        case "$arg" in
+            --nas) nas=1 ;;
+            --docker) docker=1 ;;
+            --cockpit) cockpit=1 ;;
+            --sin-escritorio) sinescritorio=1 ;;
+            --autoencendido) autoencendido=1 ;;
+            *) echo "Opción desconocida: $arg" >&2; exit 2 ;;
+        esac
+    done
+    usuario=$(usuario_principal)
+    mkdir -p "$DIR"
+
+    base_activar
+    if [ $nas = 1 ]; then nas_activar "$usuario"; else nas_desactivar; fi
+    if [ $docker = 1 ]; then docker_activar "$usuario" || docker=0; else docker_desactivar; fi
+    if [ $cockpit = 1 ]; then cockpit_activar || cockpit=0; else cockpit_desactivar; fi
+
+    # Sin escritorio: ahorra ~300 MB de RAM. Se aplica en el próximo arranque.
+    if [ $sinescritorio = 1 ]; then
+        systemctl set-default multi-user.target >/dev/null 2>&1
+    else
+        systemctl set-default graphical.target >/dev/null 2>&1
+    fi
+
+    # Volver a encenderse solo cuando regresa la luz tras un corte
+    if [ $autoencendido = 1 ]; then
+        systemctl enable --now renace-autoencendido.service >/dev/null 2>&1
+    else
+        systemctl disable renace-autoencendido.service >/dev/null 2>&1
+    fi
+
+    echo servidor > "$MODO"
+    cat > "$CONF" <<EOF
+nas=$nas
+docker=$docker
+cockpit=$cockpit
+sinescritorio=$sinescritorio
+autoencendido=$autoencendido
+EOF
+    echo "Modo servidor activado."
+    estado
+}
+
+modo_escritorio() {
+    mkdir -p "$DIR"
+    nas_desactivar
+    docker_desactivar
+    cockpit_desactivar
+    base_desactivar
+    systemctl set-default graphical.target >/dev/null 2>&1
+    systemctl disable renace-autoencendido.service >/dev/null 2>&1
+    echo escritorio > "$MODO"
+    rm -f "$CONF"
+    echo "Modo escritorio activado."
+}
+
+estado() {
+    local modo=escritorio
+    [ -f "$MODO" ] && modo=$(tr -d '[:space:]' < "$MODO")
+    echo "modo=$modo"
+    [ -f "$CONF" ] && cat "$CONF"
+    echo "equipo=$(hostname)"
+    echo "ip=$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "usuario=$(usuario_principal)"
+}
+
+case "${1:-estado}" in
+    servidor)
+        exigir_root
+        shift
+        modo_servidor "$@"
+        ;;
+    escritorio)
+        exigir_root
+        modo_escritorio
+        ;;
+    nas-clave)
+        # Lee la contraseña por la entrada estándar (no queda en la lista de procesos)
+        exigir_root
+        usuario=${2:-$(usuario_principal)}
+        IFS= read -r clave
+        [ -n "$clave" ] || { echo "Contraseña vacía." >&2; exit 2; }
+        printf '%s\n%s\n' "$clave" "$clave" | smbpasswd -s -a "$usuario" >/dev/null && \
+            echo "Contraseña del NAS guardada para $usuario."
+        ;;
+    estado)
+        estado
+        ;;
+    *)
+        cat <<'AYUDA'
+renace-mode — escritorio o mini servidor
+
+  renace-mode estado
+  renace-mode escritorio
+  renace-mode servidor [--nas] [--docker] [--cockpit] [--sin-escritorio] [--autoencendido]
+  renace-mode nas-clave [usuario]      (lee la contraseña por la entrada estándar)
+AYUDA
+        ;;
+esac

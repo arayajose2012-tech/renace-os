@@ -1,0 +1,35 @@
+#!/bin/sh
+# renace-lid — en modo servidor el Mac sigue encendido con la tapa cerrada;
+# este vigilante apaga la pantalla y el teclado iluminado mientras está cerrada.
+ESTADO=/run/renace-lid
+mkdir -p "$ESTADO"
+
+ls /proc/acpi/button/lid/*/state >/dev/null 2>&1 || {
+    echo "Este equipo no tiene tapa; nada que vigilar."
+    exit 0
+}
+
+tapa() {
+    if grep -qs closed /proc/acpi/button/lid/*/state; then echo cerrada; else echo abierta; fi
+}
+
+anterior=abierta
+while :; do
+    actual=$(tapa)
+    if [ "$actual" != "$anterior" ]; then
+        for luz in /sys/class/backlight/* /sys/class/leds/*kbd_backlight*; do
+            [ -w "$luz/brightness" ] || continue
+            nombre=$(basename "$luz")
+            if [ "$actual" = cerrada ]; then
+                cat "$luz/brightness" > "$ESTADO/$nombre"
+                echo 0 > "$luz/brightness"
+                [ -w "$luz/bl_power" ] && echo 4 > "$luz/bl_power"
+            else
+                [ -w "$luz/bl_power" ] && echo 0 > "$luz/bl_power"
+                [ -f "$ESTADO/$nombre" ] && cat "$ESTADO/$nombre" > "$luz/brightness"
+            fi
+        done
+        anterior=$actual
+    fi
+    sleep 3
+done

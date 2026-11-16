@@ -1,0 +1,53 @@
+#!/bin/sh
+# Paquetes opcionales: se intenta instalar cada uno por separado.
+# Si alguno no existe o falla, la compilación sigue y queda anotado.
+export DEBIAN_FRONTEND=noninteractive
+INFORME=/usr/share/renace/opcionales.txt
+mkdir -p /usr/share/renace
+: > "$INFORME"
+
+probar() {
+    if apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1; then
+        echo "OK     $*" >> "$INFORME"
+        return 0
+    fi
+    echo "FALLO  $*" >> "$INFORME"
+    return 1
+}
+
+# Firmware del controlador libre b43 (se descarga durante la compilación)
+probar firmware-b43-installer
+
+# Firmware adicional (adaptadores USB y gráficas)
+probar firmware-mediatek
+probar firmware-intel-graphics
+
+# Agente de contraseñas gráfico (hace falta uno para el Centro Renace)
+probar xfce-polkit || probar policykit-1-gnome || probar mate-polkit
+
+# Tienda de aplicaciones amigable; si no, Synaptic
+if ! apt-get install -y --install-recommends gnome-software >/dev/null 2>&1; then
+    echo "FALLO  gnome-software" >> "$INFORME"
+    probar synaptic
+else
+    echo "OK     gnome-software" >> "$INFORME"
+fi
+probar gdebi
+
+# Extras para Mac
+probar mbpfan            # control de ventiladores de MacBook
+probar hfsprogs          # leer discos con formato de Mac (HFS+)
+
+# Apariencia
+probar arc-theme
+probar papirus-icon-theme
+
+# Modo servidor
+probar cockpit           # panel web de administración
+probar docker-compose
+probar samba-vfs-modules # compatibilidad con Time Machine en Samba antiguos
+
+apt-get clean
+echo "──── Paquetes opcionales ────"
+cat "$INFORME"
+exit 0

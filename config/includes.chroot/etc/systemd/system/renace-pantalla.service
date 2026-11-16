@@ -1,0 +1,12 @@
+[Unit]
+Description=Renace OS (modo servidor): pantalla apagada con la tapa cerrada
+
+[Service]
+# Consola de texto: apagar la pantalla tras 1 minuto sin uso
+ExecStartPre=-/bin/sh -c 'TERM=linux setterm --blank 1 --powerdown 1 >/dev/tty1 </dev/tty1'
+ExecStart=/usr/local/sbin/renace-lid
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

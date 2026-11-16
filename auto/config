@@ -1,0 +1,23 @@
+#!/bin/sh
+# Renace OS — configuración de live-build (Debian 13 "trixie", amd64)
+set -e
+
+lb config noauto \
+    --mode debian \
+    --distribution trixie \
+    --architectures amd64 \
+    --linux-flavours amd64 \
+    --linux-packages "linux-image linux-headers" \
+    --archive-areas "main contrib non-free non-free-firmware" \
+    --binary-images iso-hybrid \
+    --debian-installer none \
+    --apt-recommends false \
+    --firmware-chroot false \
+    --firmware-binary false \
+    --memtest none \
+    --image-name renace-os \
+    --iso-application "Renace OS" \
+    --iso-publisher "Renace OS" \
+    --iso-volume "RENACE_OS" \
+    --bootappend-live "boot=live components quiet locales=es_ES.UTF-8 keyboard-layouts=latam,es,us" \
+    "${@}"

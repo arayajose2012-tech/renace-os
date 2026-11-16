@@ -1,0 +1,43 @@
+#!/bin/sh
+# Ajustes finales de la imagen: permisos, servicios y el instalador sin red.
+set -e
+
+# ── Permisos de las herramientas de Renace ───────────────────
+chmod 755 /usr/local/sbin/renace-* /usr/local/bin/renace-* \
+          /usr/lib/systemd/system-sleep/renace-wifi
+
+# ── Servicios ────────────────────────────────────────────────
+systemctl enable renace-wifi.service
+
+# Todo lo del modo servidor queda instalado pero apagado: no gasta RAM
+# hasta que el usuario lo activa desde el Centro Renace.
+for unidad in ssh.service ssh.socket smbd.service nmbd.service samba-ad-dc.service \
+              docker.service docker.socket containerd.service cockpit.socket \
+              renace-pantalla.service renace-autoencendido.service; do
+    systemctl disable "$unidad" 2>/dev/null || true
+done
+
+# La tienda de aplicaciones no debe quedarse residente en memoria
+rm -f /etc/xdg/autostart/org.gnome.Software.desktop \
+      /etc/xdg/autostart/gnome-software-service.desktop
+
+# ── Instalador (Calamares) sin conexión ──────────────────────
+# Los ayudantes de Debian instalan GRUB con apt durante la instalación, lo que
+# falla en un Mac que aún no tiene red. La imagen ya trae los binarios de GRUB
+# (EFI de 64 y de 32 bits, y BIOS), así que se sustituyen por versiones locales.
+for dir in /usr/sbin /usr/bin /usr/libexec /usr/lib/calamares; do
+    for nombre in calamares-bootloader-config calamares-sources-media; do
+        if [ -e "$dir/$nombre" ]; then
+            dpkg-divert --quiet --add --rename \
+                --divert "$dir/$nombre.debian" "$dir/$nombre"
+            cp "/usr/share/renace/calamares/$nombre" "$dir/$nombre"
+            chmod 755 "$dir/$nombre"
+            echo "Renace: sustituido $dir/$nombre"
+        fi
+    done
+done
+
+# ── Identidad ────────────────────────────────────────────────
+echo "Renace OS 1.0 (basado en Debian 13)" > /etc/renace-release
+mkdir -p /etc/renace
+[ -f /etc/renace/modo ] || echo escritorio > /etc/renace/modo

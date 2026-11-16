@@ -1,0 +1,4 @@
+# Renace OS — intercambio comprimido en RAM (equivale a tener más memoria)
+ALGO=zstd
+PERCENT=60
+PRIORITY=100

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Bienvenida de Renace OS
+Exec=/usr/local/bin/renace-primer-inicio
+OnlyShowIn=XFCE;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

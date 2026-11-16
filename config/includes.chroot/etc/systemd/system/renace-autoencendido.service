@@ -1,0 +1,10 @@
+[Unit]
+Description=Renace OS (modo servidor): encender solo tras un corte de luz
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/renace-autoencendido
+
+[Install]
+WantedBy=multi-user.target

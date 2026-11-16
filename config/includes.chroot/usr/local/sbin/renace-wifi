@@ -1,0 +1,316 @@
+#!/bin/bash
+# renace-wifi — detecta el chip Wi-Fi del Mac y carga el controlador que funciona.
+#
+# El problema que resuelve: los Mac antiguos llevan chips Broadcom para los que
+# Linux tiene CUATRO controladores (wl, b43, brcmsmac, brcmfmac) que se pisan
+# entre sí. Aquí ninguno se carga solo: este programa mira el chip, elige el
+# mejor, y si no levanta una interfaz prueba el siguiente.
+set -u
+PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+DIR=/etc/renace
+FIJO=$DIR/wifi-driver                      # elección manual (opcional)
+AUTO=/etc/modprobe.d/renace-wifi-auto.conf # generado por este programa
+LOG=/var/log/renace-wifi.log
+
+# id PCI | nombre | controladores por orden de preferencia
+TABLA='
+4311|BCM4311|wl b43
+4312|BCM4311 (doble banda)|wl b43
+4315|BCM4312|wl b43
+4318|BCM4318|b43
+4328|BCM4321|wl b43
+4329|BCM4321|wl b43
+432a|BCM4321|wl b43
+432b|BCM4322|wl b43
+432c|BCM4322|wl b43
+432d|BCM4322|wl b43
+4331|BCM4331|wl b43
+4353|BCM43224|wl brcmsmac b43
+4357|BCM43225|wl brcmsmac b43
+4727|BCM4313|wl brcmsmac
+4358|BCM43227|wl b43
+4359|BCM43228|wl
+4365|BCM43142|wl
+43a0|BCM4360|wl
+43b1|BCM4352|wl
+43a3|BCM4350|brcmfmac
+43ba|BCM43602|brcmfmac
+43bb|BCM43602|brcmfmac
+43bc|BCM43602|brcmfmac
+4464|BCM4364|brcmfmac
+'
+
+VENDOR="" DEVICE="" SLOT="" NOMBRE="" CANDIDATOS=""
+
+anotar() {
+    echo "$*"
+    [ -w "$(dirname "$LOG")" ] && echo "$(date '+%F %T') $*" >> "$LOG" 2>/dev/null
+}
+
+exigir_root() {
+    if [ "$(id -u)" != 0 ]; then
+        echo "Esta acción necesita permisos de administrador (use sudo)." >&2
+        exit 1
+    fi
+}
+
+# Primera tarjeta de red inalámbrica PCI (clase 0x0280xx); se prefiere Broadcom
+buscar_tarjeta() {
+    local d clase v
+    SLOT=""
+    for d in /sys/bus/pci/devices/*; do
+        clase=$(cat "$d/class" 2>/dev/null) || continue
+        case "$clase" in 0x0280*) ;; *) continue ;; esac
+        v=$(cat "$d/vendor"); v=${v#0x}
+        if [ -z "$SLOT" ] || [ "$v" = 14e4 ]; then
+            VENDOR=$v
+            DEVICE=$(cat "$d/device"); DEVICE=${DEVICE#0x}
+            SLOT=$(basename "$d")
+        fi
+    done
+    [ -n "$SLOT" ]
+}
+
+identificar() {
+    local linea
+    CANDIDATOS=""
+    if [ "$VENDOR" != 14e4 ]; then
+        NOMBRE="Tarjeta no Broadcom"
+        return
+    fi
+    linea=$(printf '%s\n' "$TABLA" | grep -i "^$DEVICE|" | head -n1)
+    if [ -n "$linea" ]; then
+        NOMBRE=$(echo "$linea" | cut -d'|' -f2)
+        CANDIDATOS=$(echo "$linea" | cut -d'|' -f3)
+    else
+        NOMBRE="Broadcom sin catalogar"
+        CANDIDATOS="wl brcmfmac b43 brcmsmac"
+    fi
+}
+
+# Interfaz Wi-Fi que cuelga de nuestra tarjeta (ignora adaptadores USB)
+interfaz() {
+    local n
+    for n in /sys/class/net/*; do
+        [ -d "$n/wireless" ] || [ -e "$n/phy80211" ] || continue
+        case "$(readlink -f "$n/device" 2>/dev/null)" in
+            *"/$SLOT"|*"/$SLOT/"*) basename "$n"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+controlador_actual() {
+    local i
+    if i=$(interfaz); then
+        basename "$(readlink -f "/sys/class/net/$i/device/driver" 2>/dev/null)"
+    elif [ -e "/sys/bus/pci/devices/$SLOT/driver" ]; then
+        basename "$(readlink -f "/sys/bus/pci/devices/$SLOT/driver")"
+    else
+        echo "ninguno"
+    fi
+}
+
+disponible() {
+    modinfo "$1" >/dev/null 2>&1 || return 1
+    if [ "$1" = b43 ] && [ ! -d /lib/firmware/b43 ]; then
+        return 1
+    fi
+    return 0
+}
+
+descargar_todo() {
+    local m
+    for m in wl b43 brcmsmac; do
+        modprobe -r "$m" 2>/dev/null
+    done
+}
+
+cargar() {
+    local drv=$1
+    case "$drv" in
+        wl)
+            # wl necesita que los buses bcma/ssb no se queden con la tarjeta.
+            # Primero la lista negra (para que udev no los recargue), luego fuera.
+            printf '# Generado por renace-wifi: en uso el controlador wl\nblacklist bcma\nblacklist ssb\n' > "$AUTO"
+            descargar_todo
+            modprobe -r bcma 2>/dev/null
+            modprobe -r ssb 2>/dev/null
+            modprobe wl
+            ;;
+        b43|brcmsmac)
+            rm -f "$AUTO"
+            descargar_todo
+            modprobe ssb 2>/dev/null
+            modprobe bcma 2>/dev/null
+            modprobe "$drv"
+            ;;
+        *)
+            rm -f "$AUTO"
+            descargar_todo
+            modprobe "$drv"
+            ;;
+    esac
+}
+
+esperar_interfaz() {
+    local n
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        interfaz >/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Elige y carga el controlador. Devuelve 0 si la tarjeta queda funcionando.
+activar() {
+    local orden="" fijo="" drv visto=" "
+
+    if ! buscar_tarjeta; then
+        anotar "No se encontró ninguna tarjeta Wi-Fi interna."
+        return 1
+    fi
+    identificar
+
+    if [ -z "$CANDIDATOS" ]; then
+        rm -f "$AUTO"
+        anotar "$NOMBRE ($VENDOR:$DEVICE): la gestiona el kernel directamente."
+        return 0
+    fi
+
+    [ -f "$FIJO" ] && fijo=$(tr -d '[:space:]' < "$FIJO")
+    [ "$fijo" = auto ] && fijo=""
+    orden="$fijo $CANDIDATOS"
+
+    # Si ya está funcionando con el controlador preferido, no tocar nada
+    drv=$(echo $orden | cut -d' ' -f1)
+    if interfaz >/dev/null && [ "$(controlador_actual)" = "$drv" ]; then
+        anotar "$NOMBRE ($VENDOR:$DEVICE) ya funciona con $drv."
+        return 0
+    fi
+
+    for drv in $orden; do
+        case "$visto" in *" $drv "*) continue ;; esac
+        visto="$visto$drv "
+        if ! disponible "$drv"; then
+            anotar "Controlador $drv no disponible en este sistema; se omite."
+            continue
+        fi
+        anotar "$NOMBRE ($VENDOR:$DEVICE): probando controlador $drv…"
+        cargar "$drv"
+        if esperar_interfaz; then
+            rfkill unblock wifi 2>/dev/null
+            anotar "Wi-Fi operativo con $drv (interfaz $(interfaz))."
+            return 0
+        fi
+        anotar "El controlador $drv no levantó la tarjeta."
+    done
+    anotar "Ningún controlador funcionó con $NOMBRE ($VENDOR:$DEVICE)."
+    return 1
+}
+
+estado() {
+    local i
+    if ! buscar_tarjeta; then
+        echo "Tarjeta: no se detecta ninguna tarjeta Wi-Fi interna"
+        echo "Opciones:"
+        return 0
+    fi
+    identificar
+    echo "Tarjeta: $NOMBRE ($VENDOR:$DEVICE)"
+    echo "Controlador en uso: $(controlador_actual)"
+    if i=$(interfaz); then
+        echo "Interfaz: $i"
+        echo "Red: $(nmcli -t -f DEVICE,STATE,CONNECTION device 2>/dev/null | grep "^$i:" | cut -d: -f2- | tr ':' ' ')"
+    else
+        echo "Interfaz: ninguna (el Wi-Fi no está funcionando)"
+    fi
+    if [ -f "$FIJO" ] && [ "$(tr -d '[:space:]' < "$FIJO")" != auto ]; then
+        echo "Elección: fija ($(tr -d '[:space:]' < "$FIJO"))"
+    else
+        echo "Elección: automática"
+    fi
+    echo "Opciones: $CANDIDATOS"
+}
+
+informe() {
+    echo "===== Informe Wi-Fi de Renace OS — $(date) ====="
+    cat /etc/renace-release 2>/dev/null
+    uname -a
+    echo; echo "--- Equipo ---"
+    cat /sys/class/dmi/id/product_name 2>/dev/null
+    echo; echo "--- Estado ---"
+    estado
+    echo; echo "--- Tarjetas de red (PCI) ---"
+    lspci -nnk 2>/dev/null | grep -iA3 'network\|wireless\|ethernet'
+    echo; echo "--- Módulos cargados ---"
+    lsmod | grep -E '^(wl|b43|bcma|ssb|brcmsmac|brcmfmac|cfg80211|mac80211) '
+    echo; echo "--- DKMS ---"
+    dkms status 2>/dev/null
+    echo; echo "--- Bloqueos (rfkill) ---"
+    rfkill list 2>/dev/null
+    echo; echo "--- Mensajes del kernel ---"
+    dmesg 2>/dev/null | grep -iE 'wl[: ]|b43|bcma|ssb|brcm|firmware|80211' | tail -n 60
+    echo; echo "--- Registro de renace-wifi ---"
+    tail -n 40 "$LOG" 2>/dev/null
+}
+
+case "${1:-estado}" in
+    inicio)
+        exigir_root
+        mkdir -p "$DIR"
+        activar
+        exit 0   # nunca bloquear el arranque
+        ;;
+    estado)
+        estado
+        ;;
+    usar)
+        exigir_root
+        mkdir -p "$DIR"
+        case "${2:-}" in
+            auto) rm -f "$FIJO" ;;
+            wl|b43|brcmsmac|brcmfmac) echo "$2" > "$FIJO" ;;
+            *) echo "Uso: renace-wifi usar auto|wl|b43|brcmsmac|brcmfmac" >&2; exit 2 ;;
+        esac
+        activar
+        ;;
+    reparar)
+        exigir_root
+        rfkill unblock all 2>/dev/null
+        if buscar_tarjeta; then
+            identificar
+            # Forzar una recarga completa del controlador
+            [ -n "$CANDIDATOS" ] && { descargar_todo; sleep 1; }
+        fi
+        activar
+        resultado=$?
+        systemctl restart NetworkManager 2>/dev/null
+        exit $resultado
+        ;;
+    reanudar)
+        # Tras suspender: algunos chips Broadcom no vuelven solos
+        exigir_root
+        sleep 3
+        buscar_tarjeta || exit 0
+        interfaz >/dev/null && exit 0
+        anotar "El Wi-Fi no volvió tras la suspensión; recargando."
+        identificar
+        [ -n "$CANDIDATOS" ] && descargar_todo
+        activar
+        ;;
+    informe)
+        informe
+        ;;
+    *)
+        cat <<'AYUDA'
+renace-wifi — Wi-Fi para Macs antiguos
+
+  renace-wifi estado      Muestra el chip, el controlador y la conexión
+  renace-wifi reparar     Recarga el controlador y reinicia la red
+  renace-wifi usar X      Fija un controlador: auto, wl, b43, brcmsmac, brcmfmac
+  renace-wifi informe     Diagnóstico completo para pedir ayuda
+AYUDA
+        ;;
+esac

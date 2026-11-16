@@ -1,0 +1,43 @@
+name: Construir ISO de Renace OS
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Compilar la ISO
+        run: |
+          sudo docker run --rm --privileged -v "$PWD":/src -w /src debian:trixie \
+            bash ./build.sh --dentro
+
+      - name: Guardar el registro de compilación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registro-de-compilacion
+          path: |
+            out/build.log
+            out/opcionales.txt
+          if-no-files-found: ignore
+
+      - name: Publicar la ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: renace-os-iso
+          path: |
+            out/renace-os-amd64.iso
+            out/renace-os-amd64.iso.sha256
+          compression-level: 0
+          retention-days: 14

@@ -1,0 +1,32 @@
+#!/bin/sh
+# renace-autoencendido — pide al chipset del Mac que vuelva a encenderse solo
+# cuando regresa la corriente tras un apagón (equivale a la opción de macOS
+# "Arrancar automáticamente tras un corte de suministro").
+#
+# EXPERIMENTAL: solo actúa sobre los dos chipsets en los que este ajuste está
+# documentado; en cualquier otro no toca nada.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+leer() { cat "/sys/bus/pci/devices/$1/$2" 2>/dev/null; }
+
+# Chipsets Intel clásicos (ICH/PCH hasta 2015): puente LPC en 00:1f.0,
+# registro GEN_PMCON_3 (0xa4), bit 0 = quedarse apagado tras un corte.
+if [ "$(leer 0000:00:1f.0 vendor)" = 0x8086 ] && \
+   [ "$(leer 0000:00:1f.0 class)" = 0x060100 ]; then
+    valor=$(setpci -s 00:1f.0 0xa4.b) || exit 0
+    nuevo=$(printf '%02x' $(( 0x$valor & 0xfe )))
+    setpci -s 00:1f.0 0xa4.b="$nuevo"
+    echo "Autoencendido activado (Intel LPC: 0x$valor -> 0x$nuevo)."
+    exit 0
+fi
+
+# Chipset Nvidia MCP79/MCP89 (MacBook y Mac mini de 2009-2010)
+if [ "$(leer 0000:00:03.0 vendor)" = 0x10de ] && \
+   [ "$(leer 0000:00:03.0 class)" = 0x060100 ]; then
+    setpci -s 00:03.0 0x7b.b=0x19
+    echo "Autoencendido activado (Nvidia MCP)."
+    exit 0
+fi
+
+echo "Chipset no reconocido: no se ha cambiado nada."
+exit 0

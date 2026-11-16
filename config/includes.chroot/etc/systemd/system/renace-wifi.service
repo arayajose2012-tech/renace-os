@@ -1,0 +1,14 @@
+[Unit]
+Description=Renace OS: elegir el controlador Wi-Fi del Mac
+After=systemd-modules-load.service
+Before=NetworkManager.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/renace-wifi inicio
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
