@@ -41,6 +41,37 @@ for nombre in calamares-bootloader-config calamares-sources-media; do
     echo "Renace: sustituido $ruta"
 done
 
+# ── Instalador: sin validación de contraseñas por diccionario ──
+# Calamares comprueba la contraseña con libpwquality y falla si no encuentra el
+# diccionario. Se elimina ese bloque de users.conf y se conservan el resto de
+# ajustes (grupos, sudo, etc.).
+USERS=/etc/calamares/modules/users.conf
+if [ -f "$USERS" ]; then
+    python3 - "$USERS" <<'PY'
+import re, sys
+ruta = sys.argv[1]
+salida, saltando, sangria = [], False, 0
+for linea in open(ruta, encoding="utf-8").read().splitlines():
+    if saltando:
+        if linea.strip() == "" or len(linea) - len(linea.lstrip()) > sangria:
+            continue
+        saltando = False
+    if re.match(r"^\s*libpwquality\s*:", linea):
+        saltando = True
+        sangria = len(linea) - len(linea.lstrip())
+        continue
+    salida.append(linea)
+open(ruta, "w", encoding="utf-8").write("\n".join(salida) + "\n")
+PY
+    if grep -q libpwquality "$USERS"; then
+        echo "AVISO Renace: no se pudo quitar libpwquality de $USERS" >&2
+    else
+        echo "Renace: validación por diccionario eliminada de $USERS"
+    fi
+else
+    echo "AVISO Renace: no existe $USERS" >&2
+fi
+
 # ── Identidad ────────────────────────────────────────────────
 echo "Renace OS 1.0 (basado en Debian 13)" > /etc/renace-release
 mkdir -p /etc/renace

@@ -2,6 +2,8 @@
 # user-setup crea el usuario "user" del modo de prueba (live); sin él no se
 # puede iniciar sesión al arrancar desde el USB.
 user-setup
+wamerican
+cracklib-runtime
 live-tools
 uuid-runtime
 sudo
